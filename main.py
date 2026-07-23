@@ -4,7 +4,14 @@ from pydantic import BaseModel
 from openai import OpenAI
 
 app = FastAPI(title="Kotoba Content Moderation Service")
-client = OpenAI()
+client = None
+
+
+def get_client():
+    global client
+    if client is None:
+        client = OpenAI()
+    return client
 
 
 class ModerationRequest(BaseModel):
@@ -56,7 +63,7 @@ def moderate(req: ModerationRequest):
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
     # Layer 1: OpenAI Moderation API (free, instant)
-    mod = client.moderations.create(
+    mod = get_client().moderations.create(
         model="omni-moderation-latest",
         input=req.text,
     )
@@ -88,7 +95,7 @@ Texto: "{req.text}"
 Retorna SOLO JSON válido."""
 
     try:
-        chat = client.chat.completions.create(
+        chat = get_client().chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You output only valid JSON. No markdown."},
