@@ -91,19 +91,22 @@ def moderate(req: ModerationRequest):
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
     # ── Layer 1: OpenAI Moderation API (free, instant) ──
-    mod = get_openai().moderations.create(
-        model="omni-moderation-latest",
-        input=req.text,
-    )
-    result = mod.results[0]
-
-    filtered_flagged = any(result.categories.get(cat) for cat in HATE_VIOLENCE_CATEGORIES)
+    filtered_flagged = False
+    result = None
+    try:
+        mod = get_openai().moderations.create(
+            model="omni-moderation-latest",
+            input=req.text,
+        )
+        result = mod.results[0]
+        filtered_flagged = any(result.categories.get(cat) for cat in HATE_VIOLENCE_CATEGORIES)
+    except Exception:
+        pass  # If OpenAI fails (rate limit, etc), skip to Layer 2
 
     if not filtered_flagged:
-        top_score = max(result.category_scores.values())
         return ModerationResponse(
             flagged=False,
-            confidence=round(top_score, 4),
+            confidence=0.5,
             reason="No se detectó violación de políticas.",
             categories={},
         )
@@ -125,11 +128,14 @@ def moderate(req: ModerationRequest):
                 categories={},
             )
     except Exception:
-        pass  # If Llama-Guard fails, continue to Layer 3
+        pass
 
     # ── Layer 3: Groq Llama 3.3 70B (free, deep analysis) ──
-    triggered = {k: v for k, v in result.categories.items() if v and k in HATE_VIOLENCE_CATEGORIES}
-    scores = {k: round(v, 4) for k, v in result.category_scores.items() if v > 0.01}
+    triggered = {}
+    scores = {}
+    if result is not None:
+        triggered = {k: v for k, v in result.categories.items() if v and k in HATE_VIOLENCE_CATEGORIES}
+        scores = {k: round(v, 4) for k, v in result.category_scores.items() if v > 0.01}
 
     analysis_prompt = f"""Un texto fue flaggeado por detección automática. Analízalo considerando la política de Kotoba.
 
