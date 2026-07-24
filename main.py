@@ -2,16 +2,26 @@ import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from openai import OpenAI
+from groq import Groq
 
 app = FastAPI(title="Kotoba Content Moderation Service")
-client = None
+
+openai_client = None
+groq_client = None
 
 
-def get_client():
-    global client
-    if client is None:
-        client = OpenAI()
-    return client
+def get_openai():
+    global openai_client
+    if openai_client is None:
+        openai_client = OpenAI()
+    return openai_client
+
+
+def get_groq():
+    global groq_client
+    if groq_client is None:
+        groq_client = Groq()
+    return groq_client
 
 
 class ModerationRequest(BaseModel):
@@ -25,7 +35,13 @@ class ModerationResponse(BaseModel):
     categories: dict[str, bool]
 
 
-MODERATION_PROMPT = """Eres un sistema de moderación de contenido para Kotoba, una aplicación de lectura/escritura de historias en español.
+HATE_VIOLENCE_CATEGORIES = [
+    'hate', 'hate/threatening', 'harassment', 'harassment/threatening',
+    'violence', 'violence/graphic', 'self-harm', 'self-harm/intent',
+    'self-harm/instructions', 'illicit', 'illicit/violent',
+]
+
+MODERATION_PROMPT = """Eres un moderador de contenido experto para Kotoba, una app de lectura/escritura de historias en español.
 
 ## POLÍTICA DE CONTENIDO DE KOTOBA
 
@@ -41,7 +57,7 @@ MODERATION_PROMPT = """Eres un sistema de moderación de contenido para Kotoba, 
 ### CONTENIDO PROHIBIDO (SÍ BANDEREAR):
 - Odio hacia grupos protegidos (raza, etnia, religión, orientación sexual, género, discapacidad, nacionalidad)
 - Odio disfrazado / codificado:
-  * Eufemismos para referirse a grupos (ej: "cucarachas", "plagas", "parásitos" para referirse a personas de cierta raza/etnia)
+  * Eufemismos para referirse a grupos (ej: "cucarachas", "plagas", "parásitos" para personas de cierta raza)
   * Dog whistles: lenguaje que suena inocente pero tiene significado de odio oculto
   * Metáforas que deshumanizan grupos de personas
   * Sarcasmo que esconde odio real
@@ -53,14 +69,14 @@ MODERATION_PROMPT = """Eres un sistema de moderación de contenido para Kotoba, 
 - NO confundas ficción legítima con odio. Un personaje racista en una historia NO es odio si el autor no promueve esas ideas.
 - Analiza la INTENCIÓN y el CONTEXTO, no solo palabras sueltas.
 - Si hay duda razonable, aprueba el contenido.
-- Si el contenido es sexual pero NO contiene odio, responde "flagged: false".
-- Piensa en español ya que el contenido es en español.
+- Si el contenido es sexual pero NO contiene odio, responde con categorías vacías.
 
 Responde SOLO con JSON válido:
 {
+  "is_hate_speech": true/false,
+  "confidence": 0.0-1.0,
   "reason": "explicación breve en español",
-  "severity": "low/medium/high",
-  "categories": ["ej: racism", "xenophobia", "dehumanization", etc.]
+  "categories": ["ej: racism", "xenophobia", "dehumanization"]
 }"""
 
 
@@ -74,73 +90,82 @@ def moderate(req: ModerationRequest):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
-    # Layer 1: OpenAI Moderation API (free, instant)
-    mod = get_client().moderations.create(
+    # ── Layer 1: OpenAI Moderation API (free, instant) ──
+    mod = get_openai().moderations.create(
         model="omni-moderation-latest",
         input=req.text,
     )
     result = mod.results[0]
 
-    # Ignore 'sexual' and 'sexual/minors' categories — Kotoba allows NSFW content.
-    # Only flag hate/violence/harassment categories.
-    HATE_VIOLENCE_CATEGORIES = [
-        'hate', 'hate/threatening', 'harassment', 'harassment/threatening',
-        'violence', 'violence/graphic', 'self-harm', 'self-harm/intent',
-        'self-harm/instructions', 'illicit', 'illicit/violent',
-    ]
     filtered_flagged = any(result.categories.get(cat) for cat in HATE_VIOLENCE_CATEGORIES)
 
-    # If not flagged by the fast filter, return clean
     if not filtered_flagged:
         top_score = max(result.category_scores.values())
         return ModerationResponse(
             flagged=False,
             confidence=round(top_score, 4),
             reason="No se detectó violación de políticas.",
-            categories={k: v for k, v in result.categories.items() if v},
+            categories={},
         )
 
-    # Layer 2: GPT-4o-mini deep analysis (catches disguised/coded hate speech)
+    # ── Layer 2: Groq Llama-Guard-4 (free, fast moderation) ──
+    try:
+        guard = get_groq().chat.completions.create(
+            model="meta-llama/Llama-Guard-4-12B",
+            messages=[{"role": "user", "content": req.text}],
+        )
+        guard_response = guard.choices[0].message.content.strip()
+        is_safe = guard_response.lower().startswith("safe")
+
+        if is_safe:
+            return ModerationResponse(
+                flagged=False,
+                confidence=0.8,
+                reason="Llama-Guard determinó que el contenido es seguro.",
+                categories={},
+            )
+    except Exception:
+        pass  # If Llama-Guard fails, continue to Layer 3
+
+    # ── Layer 3: Groq Llama 3.3 70B (free, deep analysis) ──
     triggered = {k: v for k, v in result.categories.items() if v and k in HATE_VIOLENCE_CATEGORIES}
     scores = {k: round(v, 4) for k, v in result.category_scores.items() if v > 0.01}
 
-    analysis_prompt = f"""Un texto fue flaggeado por detección automática. Analízalo considerando la política de Kotoba:
-
-POLÍTICA DE KOTOBA:
-- CONTENIDO PERMITIDO: Sexual/NSFW, violencia ficticia, lenguaje vulgar, temas oscuros
-- CONTENIDO PROHIBIDO: Odio, discriminación, dehumanización de grupos protegidos
-
-Analiza el texto y retorna JSON con:
-- "reason": explicación breve (1-2 oraciones)
-- "severity": "low", "medium", o "high"
-- "categories": qué categorías de odio aplican (SOLO si es odio real)
+    analysis_prompt = f"""Un texto fue flaggeado por detección automática. Analízalo considerando la política de Kotoba.
 
 Categorías flaggeadas: {json.dumps(triggered)}
 Puntajes: {json.dumps(scores)}
 Texto: "{req.text}"
 
-Si el contenido es sexual pero NO contiene odio, retorna "reason" explicando que es contenido permitido y las categorías vacías.
-Retorna SOLO JSON válido."""
+Analiza si es odio real o contenido permitido. Responde SOLO con JSON válido."""
 
     try:
-        chat = get_client().chat.completions.create(
-            model="gpt-4o-mini",
+        chat = get_groq().chat.completions.create(
+            model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "system", "content": "You output only valid JSON. No markdown."},
+                {"role": "system", "content": MODERATION_PROMPT},
                 {"role": "user", "content": analysis_prompt},
             ],
-            response_format={"type": "json_object"},
+            temperature=0.1,
             max_tokens=200,
         )
         deep = json.loads(chat.choices[0].message.content)
     except Exception:
-        deep = {"reason": "Flaggeado por moderación automática.", "severity": "medium"}
+        deep = {"is_hate_speech": True, "reason": "Flaggeado por moderación automática.", "confidence": 0.7}
 
-    max_score = max(result.category_scores.values())
+    is_hate = deep.get("is_hate_speech", True)
+    confidence = deep.get("confidence", 0.7)
+    reason = deep.get("reason", "Análisis automático.")
+    categories = deep.get("categories", list(triggered.keys()))
+
+    if isinstance(categories, list):
+        categories = {c: True for c in categories}
+    elif not isinstance(categories, dict):
+        categories = {c: True for c in triggered.keys()}
 
     return ModerationResponse(
-        flagged=True,
-        confidence=round(max_score, 4),
-        reason=deep.get("reason", "Flaggeado por moderación automática."),
-        categories=triggered,
+        flagged=is_hate,
+        confidence=round(confidence, 4) if isinstance(confidence, (int, float)) else 0.7,
+        reason=reason,
+        categories=categories if is_hate else {},
     )
