@@ -92,6 +92,7 @@ def moderate(req: ModerationRequest):
 
     # ── Layer 1: OpenAI Moderation API (free, instant) ──
     filtered_flagged = False
+    openai_succeeded = False
     result = None
     try:
         mod = get_openai().moderations.create(
@@ -99,11 +100,13 @@ def moderate(req: ModerationRequest):
             input=req.text,
         )
         result = mod.results[0]
+        openai_succeeded = True
         filtered_flagged = any(result.categories.get(cat) for cat in HATE_VIOLENCE_CATEGORIES)
     except Exception:
         pass  # If OpenAI fails (rate limit, etc), skip to Layer 2
 
-    if not filtered_flagged:
+    # If OpenAI succeeded and didn't flag, we're done
+    if openai_succeeded and not filtered_flagged:
         return ModerationResponse(
             flagged=False,
             confidence=0.5,
